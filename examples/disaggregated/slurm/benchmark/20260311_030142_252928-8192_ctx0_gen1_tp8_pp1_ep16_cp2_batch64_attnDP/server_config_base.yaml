@@ -1,0 +1,10 @@
+backend: pytorch
+context_servers:
+  num_instances: 0
+  urls: []
+generation_servers:
+  num_instances: 1
+  urls:
+  - <node0_placeholder>:8000
+hostname: <node0_placeholder>
+port: 8333

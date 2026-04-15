@@ -1,0 +1,125 @@
+# SLURM Configuration
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "gb300"
+  account: "coreai_comparch_infbench"
+  job_time: "02:00:00"
+  job_name: "coreai_comparch_infbench-helix.benchmark"
+  extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
+  set_segment: true # Optional: whether to set the segment for the job
+  numa_bind: true # Only enable for GB200/GB300 NVL72
+
+# Benchmark Mode
+benchmark:
+  mode: "gen_only_no_context"  # Options: e2e, gen_only, gen_only_no_context
+  use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
+  multi_round: 1  # Number of benchmark rounds
+  benchmark_ratio: 1.0  # Benchmark ratio
+  streaming: true  # Enable streaming mode
+  concurrency_list: "64"
+  input_length: 252928  # Input sequence length
+  output_length: 8192  # Output sequence length
+  dataset_file: "/lustre/fsw/coreai_comparch_infbench/shicli/aa_synthetic_generation/datasets/random/kimi-k2-252928-8192-8192-ratio-1-prefix-0_for_serve.json"
+
+# Hardware Configuration
+hardware:
+  gpus_per_node: 4  # Modify this with your hardware configuration
+  num_ctx_servers: 0  # Number of context servers (set to 0 for gen_only_no_context mode)
+  num_gen_servers: 1  # Number of generation servers
+
+# Environment Configuration
+environment:
+  container_mount: "/lustre/"  # Format: path1:path1,path2:path2
+  container_image: "gitlab-master.nvidia.com/compute/anna/infrastructure/benchmarking_toolkit/trt-llm/main_aarch:45760769"
+  model_path: "/lustre/fsw/coreai_comparch_infbench/common/nvfp4_checkpoints/Kimi-K2-Thinking-NVFP4"
+  trtllm_repo: ""
+  build_wheel: false  # Don't build the wheel when launching multiple jobs
+  cuda_architectures: "100-real;103-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
+  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
+  work_dir: "/lustre/fsw/coreai_comparch_infbench/shicli/TensorRT-LLM/examples/disaggregated/slurm/benchmark/"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+
+# Profiling Configuration
+profiling:
+  nsys_on: true  # Set to true to enable profiling
+  ctx_profile_range: "10-30"  # Set TLLM_PROFILE_START_STOP for ctx workers
+  gen_profile_range: "4500-4550"  # Set TLLM_PROFILE_START_STOP for gen workers
+
+# Accuracy Configuration
+accuracy:
+  enable_accuracy_test: false  # Set to true to enable accuracy evaluation
+  tasks:
+    gsm8k:
+      model: "local-completions"  # Model type for lm_eval
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        trust_remote_code: true
+
+worker_config:
+  gen:
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 8
+    enable_attention_dp: false
+    enable_lm_head_tp_in_adp: false
+    pipeline_parallel_size: 1
+    context_parallel_size: 2
+    enable_autotuner: false
+    cp_config:
+      cp_type: "HELIX"
+      tokens_per_block: 32
+      use_nccl_for_alltoall: false
+      fifo_version: 2
+    max_batch_size: 32
+    max_num_tokens: 64
+    max_seq_len: 261632
+    max_input_len: 252928
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 32
+    print_iter_log: true
+    trust_remote_code: true
+    kv_cache_config:
+      enable_block_reuse: false
+      tokens_per_block: 32
+      free_gpu_memory_fraction: 0.8
+      dtype: fp8
+    moe_config:
+      backend: CUTEDSL
+      # use_low_precision_moe_combine: true
+      # load_balancer:
+      #   num_slots: 0
+    cache_transceiver_config:
+      max_tokens_in_buffer: 4096
+      backend: UCX
+    stream_interval: 20
+    num_postprocess_workers: 4
+  ctx:
+    max_batch_size: 1
+    max_num_tokens: 252960
+    max_seq_len: 252960
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    moe_expert_parallel_size: 1
+    enable_attention_dp: false
+    pipeline_parallel_size: 8
+    print_iter_log: true
+    trust_remote_code: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+      dtype: fp8
+    cache_transceiver_config:
+      max_tokens_in_buffer: 4096
+      backend: UCX
+    pp_partition:
+    - 8
+    - 8
+    - 8
+    - 8
+    - 8
+    - 8
+    - 8
+    - 5

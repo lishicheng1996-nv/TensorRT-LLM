@@ -1,0 +1,22 @@
+{
+  "GEN": {
+    "0": {
+      "port": 8000,
+      "nodes": {
+        "<node0_placeholder>": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "<node1_placeholder>": [
+          0,
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  },
+  "CTX": {}
+}

@@ -1,0 +1,28 @@
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 4096
+context_parallel_size: 1
+cuda_graph_config: null
+disable_overlap_scheduler: true
+enable_attention_dp: false
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.5
+max_batch_size: 1
+max_num_tokens: 252960
+max_seq_len: 252960
+moe_expert_parallel_size: 1
+pipeline_parallel_size: 8
+pp_partition:
+- 8
+- 8
+- 8
+- 8
+- 8
+- 8
+- 8
+- 5
+print_iter_log: true
+tensor_parallel_size: 1
+trust_remote_code: true

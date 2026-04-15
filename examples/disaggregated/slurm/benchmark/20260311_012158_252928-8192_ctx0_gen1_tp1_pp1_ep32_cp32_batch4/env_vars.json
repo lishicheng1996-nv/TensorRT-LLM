@@ -1,0 +1,17 @@
+{
+  "server_env_var": {
+    "TRTLLM_SERVER_DISABLE_GC": "1"
+  },
+  "worker_env_var": {
+    "TLLM_LOG_LEVEL": "INFO",
+    "TRTLLM_SERVER_DISABLE_GC": "1",
+    "TRTLLM_WORKER_DISABLE_GC": "1",
+    "TRTLLM_ENABLE_PDL": "1",
+    "ENROOT_ALLOW_DEV": "yes",
+    "NCCL_GRAPH_MIXING_SUPPORT": "0"
+  },
+  "ctx_worker_env_var": {},
+  "gen_worker_env_var": {},
+  "TRT_LLM_GIT_COMMIT": "83952eef0164ce115e176d0588ad7ebb6a5a7ea5",
+  "TRT_LLM_VERSION": "1.3.0rc4"
+}

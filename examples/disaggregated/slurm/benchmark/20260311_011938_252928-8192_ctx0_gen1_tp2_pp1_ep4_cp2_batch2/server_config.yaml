@@ -1,0 +1,10 @@
+backend: pytorch
+context_servers:
+  num_instances: 0
+  urls: []
+generation_servers:
+  num_instances: 1
+  urls:
+  - theia0288:8000
+hostname: theia0288
+port: 8333
