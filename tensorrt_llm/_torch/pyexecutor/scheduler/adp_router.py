@@ -354,10 +354,20 @@ class KVCacheAwareADPRouter(ADPRouter):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem],
     ) -> RankState:
+        # Subtract cached_tokens so active-load accounting stays on the same
+        # scale as new requests in route_requests(), which use
+        # (req_tokens - match_len). Without this, requests that came in with
+        # long cached prefixes inflate the apparent load on their rank.
         if self.dist.has_cp_helix:
-            num_active_tokens = sum(req.total_input_len_cp for req in active_requests)
+            num_active_tokens = sum(
+                max(req.total_input_len_cp - req.cached_tokens, 0)
+                for req in active_requests
+            )
         else:
-            num_active_tokens = sum(req.py_orig_prompt_len for req in active_requests)
+            num_active_tokens = sum(
+                max(req.py_orig_prompt_len - req.cached_tokens, 0)
+                for req in active_requests
+            )
         return RankState(
             rank=self.dist.tp_rank,
             num_active_requests=len(active_requests),
@@ -430,6 +440,16 @@ class KVCacheAwareADPRouter(ADPRouter):
             return ()
         return tuple(token_ids[:num_tokens])
 
+    @staticmethod
+    def _req_tokens(req_item) -> int:
+        if req_item.request is None:
+            return 0
+        return len(getattr(req_item.request, "input_token_ids", []))
+
+    def _match_len(self, rank: int, req_id: int) -> int:
+        matches = self._all_ranks_prefix_matches
+        return matches[rank].get(req_id, 0) if rank < len(matches) else 0
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -462,18 +482,19 @@ class KVCacheAwareADPRouter(ADPRouter):
                     and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
                 ):
                     all_ranks_num_active_requests[target_dp_rank] += 1
+                    # Keep token tally in sync so the balancing phase sees
+                    # the load that hard-pinned requests just added.
+                    effective = max(
+                        self._req_tokens(req_item)
+                        - self._match_len(target_dp_rank, req_item.id),
+                        0,
+                    )
+                    all_ranks_num_active_tokens[target_dp_rank] += effective
                     scheduled = True
                     all_ranks_new_requests[target_dp_rank].append(req_item)
 
             if not scheduled:
                 remaining_unscheduled.append(req_item)
-
-        num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
-        )
 
         # --- Prefix-affinity sorting ---
         # Sort by prefix fingerprint first (group related requests together),
@@ -488,21 +509,16 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         remaining_unscheduled = sorted(remaining_unscheduled, key=_sort_key)
 
-        eligible_ranks = [
-            rank
-            for rank in range(tp_size)
-            if all_ranks_num_active_requests[rank] < expected_num_active_requests
-        ]
-
-        prefix_matches = self._all_ranks_prefix_matches
+        # Hard gate disabled: let cache affinity (plus token tiebreak) fully
+        # decide rank selection. Concentration is prevented by the load-aware
+        # tiebreak, not by a per-rank fair-share cap.
+        eligible_ranks = list(range(tp_size))
 
         for req_item in remaining_unscheduled:
             if not eligible_ranks:
                 break
 
-            req_tokens = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
+            req_tokens = self._req_tokens(req_item)
             req_id = req_item.id
 
             best_rank = eligible_ranks[0]
@@ -520,24 +536,31 @@ class KVCacheAwareADPRouter(ADPRouter):
             load_denom = max(total_load, float(req_tokens))
 
             for rank in eligible_ranks:
-                match_len = prefix_matches[rank].get(req_id, 0) if rank < len(prefix_matches) else 0
+                match_len = self._match_len(rank, req_id)
                 score = self._score_rank(
                     req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
                 )
-                if score < best_score:
+                # Break ties on per-rank active tokens to spread traffic when
+                # the cache signal is absent (cold start) or identical across
+                # ranks. When scores differ, cache-affinity still wins.
+                if (score, all_ranks_num_active_tokens[rank]) < (
+                    best_score, all_ranks_num_active_tokens[best_rank]
+                ):
                     best_score = score
                     best_rank = rank
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
 
-            match_len = (
-                prefix_matches[best_rank].get(req_id, 0) if best_rank < len(prefix_matches) else 0
-            )
-            effective_added = req_tokens - match_len
+            effective_added = max(req_tokens - self._match_len(best_rank, req_id), 0)
             all_ranks_num_active_tokens[best_rank] += effective_added
 
-            if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
-                eligible_ranks.remove(best_rank)
+        # Report unbounded expected_num_active_requests when any rank has
+        # load, matching the convention used elsewhere for "no per-rank cap".
+        # Idle DP group -> 0 so py_executor skips dummy-padding work.
+        if sum(all_ranks_num_active_requests) == 0:
+            expected_num_active_requests = 0
+        else:
+            expected_num_active_requests = 2**31 - 1
 
         return all_ranks_new_requests, expected_num_active_requests
