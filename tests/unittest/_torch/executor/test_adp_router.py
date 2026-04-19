@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     DefaultADPRouter,
+    KVCacheAwareADPRouter,
     RankState,
 )
 
@@ -822,3 +823,79 @@ def test_balance_requests_across_ranks_token_count_sorting():
     assert result[0][0] == req2
     assert result[1][0] == req3
     assert result[2][0] == req1
+
+
+class TestKVCacheAwareADPRouterDecisionLog:
+    """Covers the env-var-gated per-decision JSON log.
+
+    The log is pure observation: it must never change routing behavior and must
+    stay silent by default.
+    """
+
+    def _make_router(self, tp_size=2, tp_rank=0, lbw=1.0):
+        dist = _mock_dist(tp_rank=tp_rank, tp_size=tp_size)
+        dist.tp_allgather = lambda data: [list(data) for _ in range(tp_size)]
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.enable_block_reuse = True
+        router = KVCacheAwareADPRouter(
+            dist=dist, kv_cache_manager=kv_cache_manager, load_balance_weight=lbw
+        )
+        # Pre-populate prefix matches: rank 0 has 0 match, rank 1 has 50 match.
+        # So rank 1 should win on cache.
+        router._all_ranks_prefix_matches = [
+            {0: 0, 1: 0},   # rank 0's view
+            {0: 0, 1: 50},  # rank 1's view: req 1 has 50 matched tokens on rank 1
+        ]
+        return router
+
+    def _rank_states(self, tp_size, active_reqs=None, active_tokens=None):
+        active_reqs = active_reqs or [0] * tp_size
+        active_tokens = active_tokens or [0] * tp_size
+        return [
+            RankState(rank=r, num_active_requests=active_reqs[r],
+                      num_active_tokens=active_tokens[r])
+            for r in range(tp_size)
+        ]
+
+    def test_log_disabled_by_default(self, monkeypatch, caplog):
+        monkeypatch.delenv("TLLM_ADP_ROUTER_DECISION_LOG", raising=False)
+        router = self._make_router(tp_size=2)
+        req = _make_request_item(req_id=1, num_tokens=100)
+        with caplog.at_level("INFO"):
+            router.route_requests(
+                self._rank_states(2), [req], max_num_active_requests=10
+            )
+        combined = " ".join(r.message for r in caplog.records)
+        assert "[adp_router_v2_decision]" not in combined
+        assert "[adp_router_v2_batch]" not in combined
+
+    def test_log_enabled_emits_batch_and_decision(self, monkeypatch, caplog):
+        import logging as _py_logging
+        monkeypatch.setenv("TLLM_ADP_ROUTER_DECISION_LOG", "1")
+        router = self._make_router(tp_size=2, lbw=0.5)
+        req = _make_request_item(req_id=1, num_tokens=100)
+        # tensorrt_llm.logger is not the root logger; configure caplog to
+        # capture all 'tensorrt_llm' hierarchy INFO records.
+        caplog.set_level(_py_logging.INFO, logger="tensorrt_llm")
+        router.route_requests(
+            self._rank_states(2), [req], max_num_active_requests=10
+        )
+        msgs = [r.message for r in caplog.records]
+        batch_lines = [m for m in msgs if "[adp_router_v2_batch]" in m]
+        dec_lines = [m for m in msgs if "[adp_router_v2_decision]" in m]
+        assert len(batch_lines) == 1
+        assert len(dec_lines) == 1
+        # Parse the JSON payload out of the decision line.
+        import json as _json
+        payload = _json.loads(dec_lines[0].split("[adp_router_v2_decision]", 1)[1].strip())
+        assert payload["type"] == "decision"
+        assert payload["req_id"] == 1
+        assert payload["req_tokens"] == 100
+        assert payload["match_len"] == [0, 50]
+        assert payload["match_best"] == 50
+        assert payload["best_cache"] == 1
+        assert payload["routed"] == 1  # rank 1 has all the cache, must win
+        assert payload["routed_is_best"] == 1
+        assert isinstance(payload["score"], list) and len(payload["score"]) == 2
+        assert isinstance(payload["eff"], list) and len(payload["eff"]) == 2
+        assert payload["eff"] == [100, 50]

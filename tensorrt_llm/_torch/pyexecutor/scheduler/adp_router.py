@@ -18,10 +18,14 @@ Includes:
 from __future__ import annotations
 
 import heapq
+import json
+import os
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
+
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -348,6 +352,10 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+        # Pure-observability decision log. Enabled via env var; off by default.
+        # See docs/knowledge/adp_router_lbw_sweep_20260419.md §8 for consumers.
+        self._decision_log_enabled = os.environ.get("TLLM_ADP_ROUTER_DECISION_LOG") == "1"
+        self._decision_log_batch_id = 0
 
     def create_rank_state(
         self,
@@ -514,6 +522,28 @@ class KVCacheAwareADPRouter(ADPRouter):
         # tiebreak, not by a per-rank fair-share cap.
         eligible_ranks = list(range(tp_size))
 
+        log_enabled = self._decision_log_enabled and getattr(self.dist, "tp_rank", 0) == 0
+        if log_enabled:
+            self._decision_log_batch_id += 1
+            batch_id = self._decision_log_batch_id
+            try:
+                logger.info(
+                    "[adp_router_v2_batch] "
+                    + json.dumps({
+                        "type": "batch",
+                        "batch_id": batch_id,
+                        "lbw": float(self.load_balance_weight),
+                        "new_reqs": len(remaining_unscheduled),
+                        "tp_size": tp_size,
+                        "active_reqs_before": list(all_ranks_num_active_requests),
+                        "active_tok_before": [float(t) for t in all_ranks_num_active_tokens],
+                    })
+                )
+            except Exception:
+                pass
+        else:
+            batch_id = 0
+
         for req_item in remaining_unscheduled:
             if not eligible_ranks:
                 break
@@ -535,6 +565,17 @@ class KVCacheAwareADPRouter(ADPRouter):
             total_load = sum(all_ranks_num_active_tokens[r] for r in eligible_ranks)
             load_denom = max(total_load, float(req_tokens))
 
+            # Snapshot pre-decision state for logging (only if enabled).
+            if log_enabled:
+                snap_active_tok = list(all_ranks_num_active_tokens)
+                snap_match_len = [self._match_len(r, req_id) for r in range(tp_size)]
+                snap_eff = [max(req_tokens - snap_match_len[r], 0) for r in range(tp_size)]
+                snap_load_term = [
+                    self.load_balance_weight * (snap_active_tok[r] / load_denom * req_tokens)
+                    for r in range(tp_size)
+                ]
+                snap_score = [snap_eff[r] + snap_load_term[r] for r in range(tp_size)]
+
             for rank in eligible_ranks:
                 match_len = self._match_len(rank, req_id)
                 score = self._score_rank(
@@ -548,6 +589,44 @@ class KVCacheAwareADPRouter(ADPRouter):
                 ):
                     best_score = score
                     best_rank = rank
+
+            if log_enabled:
+                try:
+                    match_best = max(snap_match_len) if snap_match_len else 0
+                    best_cache_rank = (
+                        snap_match_len.index(match_best) if snap_match_len else 0
+                    )
+                    tied_count = sum(1 for s in snap_score if s == best_score)
+                    tokens = (
+                        getattr(req_item.request, "input_token_ids", []) or []
+                        if req_item.request is not None
+                        else []
+                    )
+                    fp = hash(tuple(tokens[:64])) & 0xFFFFFFFF
+                    logger.info(
+                        "[adp_router_v2_decision] "
+                        + json.dumps({
+                            "type": "decision",
+                            "batch_id": batch_id,
+                            "req_id": req_id,
+                            "req_tokens": req_tokens,
+                            "fp": fp,
+                            "match_len": snap_match_len,
+                            "active_tok": snap_active_tok,
+                            "eff": snap_eff,
+                            "load_term": snap_load_term,
+                            "score": snap_score,
+                            "routed": best_rank,
+                            "best_cache": best_cache_rank,
+                            "match_best": match_best,
+                            "match_routed": snap_match_len[best_rank],
+                            "routed_is_best": int(best_rank == best_cache_rank),
+                            "tied_count": tied_count,
+                            "tie_break_used": int(tied_count > 1),
+                        })
+                    )
+                except Exception:
+                    pass
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
