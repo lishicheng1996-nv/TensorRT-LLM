@@ -517,10 +517,21 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         remaining_unscheduled = sorted(remaining_unscheduled, key=_sort_key)
 
-        # Hard gate disabled: let cache affinity (plus token tiebreak) fully
-        # decide rank selection. Concentration is prevented by the load-aware
-        # tiebreak, not by a per-rank fair-share cap.
-        eligible_ranks = list(range(tp_size))
+        # Loose hard gate at 2x fair share: cache affinity + continuous load
+        # term in score do the soft balancing; this cap is a safety net that
+        # caps runaway concentration (esp. at lbw=0) without being tight
+        # enough to force eviction of the best-cache rank in normal cases.
+        num_new_requests_all_ranks = len(remaining_unscheduled)
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        expected_num_active_requests = max(
+            2 * (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+            max(all_ranks_num_active_requests),
+        )
+        eligible_ranks = [
+            rank
+            for rank in range(tp_size)
+            if all_ranks_num_active_requests[rank] < expected_num_active_requests
+        ]
 
         log_enabled = self._decision_log_enabled and getattr(self.dist, "tp_rank", 0) == 0
         if log_enabled:
@@ -634,12 +645,17 @@ class KVCacheAwareADPRouter(ADPRouter):
             effective_added = max(req_tokens - self._match_len(best_rank, req_id), 0)
             all_ranks_num_active_tokens[best_rank] += effective_added
 
-        # Report unbounded expected_num_active_requests when any rank has
-        # load, matching the convention used elsewhere for "no per-rank cap".
-        # Idle DP group -> 0 so py_executor skips dummy-padding work.
+            # Progressive eviction: once a rank hits the 2x fair-share cap,
+            # remove it from eligibility for the rest of this batch.
+            if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
+                try:
+                    eligible_ranks.remove(best_rank)
+                except ValueError:
+                    pass
+
+        # Report the computed per-rank cap so py_executor can size dummy
+        # padding consistently. Idle DP group -> 0.
         if sum(all_ranks_num_active_requests) == 0:
             expected_num_active_requests = 0
-        else:
-            expected_num_active_requests = 2**31 - 1
 
         return all_ranks_new_requests, expected_num_active_requests
