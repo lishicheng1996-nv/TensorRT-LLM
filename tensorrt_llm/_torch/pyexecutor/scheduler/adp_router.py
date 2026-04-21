@@ -356,6 +356,12 @@ class KVCacheAwareADPRouter(ADPRouter):
         # See docs/knowledge/adp_router_lbw_sweep_20260419.md §8 for consumers.
         self._decision_log_enabled = os.environ.get("TLLM_ADP_ROUTER_DECISION_LOG") == "1"
         self._decision_log_batch_id = 0
+        # Ranks that have not yet received a real request via this router.
+        # Until every rank is seeded, route cold-start traffic to unseeded
+        # ranks so the shared-prefix cache lock-in (small match_len beats
+        # the lbw load term) can't trap traffic on a subset of ranks.
+        # Lazy-init in route_requests once tp_size is known.
+        self._unseeded_ranks: set[int] | None = None
 
     def create_rank_state(
         self,
@@ -368,13 +374,11 @@ class KVCacheAwareADPRouter(ADPRouter):
         # long cached prefixes inflate the apparent load on their rank.
         if self.dist.has_cp_helix:
             num_active_tokens = sum(
-                max(req.total_input_len_cp - req.cached_tokens, 0)
-                for req in active_requests
+                max(req.total_input_len_cp - req.cached_tokens, 0) for req in active_requests
             )
         else:
             num_active_tokens = sum(
-                max(req.py_orig_prompt_len - req.cached_tokens, 0)
-                for req in active_requests
+                max(req.py_orig_prompt_len - req.cached_tokens, 0) for req in active_requests
             )
         return RankState(
             rank=self.dist.tp_rank,
@@ -465,6 +469,8 @@ class KVCacheAwareADPRouter(ADPRouter):
         max_num_active_requests: int,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         tp_size = len(all_rank_states)
+        if self._unseeded_ranks is None:
+            self._unseeded_ranks = set(range(tp_size))
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
         }
@@ -493,8 +499,7 @@ class KVCacheAwareADPRouter(ADPRouter):
                     # Keep token tally in sync so the balancing phase sees
                     # the load that hard-pinned requests just added.
                     effective = max(
-                        self._req_tokens(req_item)
-                        - self._match_len(target_dp_rank, req_item.id),
+                        self._req_tokens(req_item) - self._match_len(target_dp_rank, req_item.id),
                         0,
                     )
                     all_ranks_num_active_tokens[target_dp_rank] += effective
@@ -540,15 +545,17 @@ class KVCacheAwareADPRouter(ADPRouter):
             try:
                 logger.info(
                     "[adp_router_v2_batch] "
-                    + json.dumps({
-                        "type": "batch",
-                        "batch_id": batch_id,
-                        "lbw": float(self.load_balance_weight),
-                        "new_reqs": len(remaining_unscheduled),
-                        "tp_size": tp_size,
-                        "active_reqs_before": list(all_ranks_num_active_requests),
-                        "active_tok_before": [float(t) for t in all_ranks_num_active_tokens],
-                    })
+                    + json.dumps(
+                        {
+                            "type": "batch",
+                            "batch_id": batch_id,
+                            "lbw": float(self.load_balance_weight),
+                            "new_reqs": len(remaining_unscheduled),
+                            "tp_size": tp_size,
+                            "active_reqs_before": list(all_ranks_num_active_requests),
+                            "active_tok_before": [float(t) for t in all_ranks_num_active_tokens],
+                        }
+                    )
                 )
             except Exception:
                 pass
@@ -562,8 +569,22 @@ class KVCacheAwareADPRouter(ADPRouter):
             req_tokens = self._req_tokens(req_item)
             req_id = req_item.id
 
-            best_rank = eligible_ranks[0]
-            best_score = float("inf")
+            # Cold-start seeding: until every rank has served at least one
+            # real request, force-route to an unseeded rank. Otherwise the
+            # shared-prefix cache on early-seeded ranks starves the rest
+            # (the lbw load term can't overcome a 1-block match_len).
+            unseeded_eligible = [r for r in eligible_ranks if r in self._unseeded_ranks]
+            if unseeded_eligible:
+                best_rank = min(
+                    unseeded_eligible,
+                    key=lambda r: (all_ranks_num_active_tokens[r], r),
+                )
+                best_score = float("inf")  # placeholder, scoring loop skipped
+                scoring_loop = False
+            else:
+                best_rank = eligible_ranks[0]
+                best_score = float("inf")
+                scoring_loop = True
 
             # --- Normalize load term ---
             # Normalize each rank's active_tokens by the total load across all
@@ -587,26 +608,26 @@ class KVCacheAwareADPRouter(ADPRouter):
                 ]
                 snap_score = [snap_eff[r] + snap_load_term[r] for r in range(tp_size)]
 
-            for rank in eligible_ranks:
-                match_len = self._match_len(rank, req_id)
-                score = self._score_rank(
-                    req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
-                )
-                # Break ties on per-rank active tokens to spread traffic when
-                # the cache signal is absent (cold start) or identical across
-                # ranks. When scores differ, cache-affinity still wins.
-                if (score, all_ranks_num_active_tokens[rank]) < (
-                    best_score, all_ranks_num_active_tokens[best_rank]
-                ):
-                    best_score = score
-                    best_rank = rank
+            if scoring_loop:
+                for rank in eligible_ranks:
+                    match_len = self._match_len(rank, req_id)
+                    score = self._score_rank(
+                        req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
+                    )
+                    # Break ties on per-rank active tokens to spread traffic when
+                    # the cache signal is absent (cold start) or identical across
+                    # ranks. When scores differ, cache-affinity still wins.
+                    if (score, all_ranks_num_active_tokens[rank]) < (
+                        best_score,
+                        all_ranks_num_active_tokens[best_rank],
+                    ):
+                        best_score = score
+                        best_rank = rank
 
             if log_enabled:
                 try:
                     match_best = max(snap_match_len) if snap_match_len else 0
-                    best_cache_rank = (
-                        snap_match_len.index(match_best) if snap_match_len else 0
-                    )
+                    best_cache_rank = snap_match_len.index(match_best) if snap_match_len else 0
                     tied_count = sum(1 for s in snap_score if s == best_score)
                     tokens = (
                         getattr(req_item.request, "input_token_ids", []) or []
@@ -616,31 +637,34 @@ class KVCacheAwareADPRouter(ADPRouter):
                     fp = hash(tuple(tokens[:64])) & 0xFFFFFFFF
                     logger.info(
                         "[adp_router_v2_decision] "
-                        + json.dumps({
-                            "type": "decision",
-                            "batch_id": batch_id,
-                            "req_id": req_id,
-                            "req_tokens": req_tokens,
-                            "fp": fp,
-                            "match_len": snap_match_len,
-                            "active_tok": snap_active_tok,
-                            "eff": snap_eff,
-                            "load_term": snap_load_term,
-                            "score": snap_score,
-                            "routed": best_rank,
-                            "best_cache": best_cache_rank,
-                            "match_best": match_best,
-                            "match_routed": snap_match_len[best_rank],
-                            "routed_is_best": int(best_rank == best_cache_rank),
-                            "tied_count": tied_count,
-                            "tie_break_used": int(tied_count > 1),
-                        })
+                        + json.dumps(
+                            {
+                                "type": "decision",
+                                "batch_id": batch_id,
+                                "req_id": req_id,
+                                "req_tokens": req_tokens,
+                                "fp": fp,
+                                "match_len": snap_match_len,
+                                "active_tok": snap_active_tok,
+                                "eff": snap_eff,
+                                "load_term": snap_load_term,
+                                "score": snap_score,
+                                "routed": best_rank,
+                                "best_cache": best_cache_rank,
+                                "match_best": match_best,
+                                "match_routed": snap_match_len[best_rank],
+                                "routed_is_best": int(best_rank == best_cache_rank),
+                                "tied_count": tied_count,
+                                "tie_break_used": int(tied_count > 1),
+                            }
+                        )
                     )
                 except Exception:
                     pass
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
+            self._unseeded_ranks.discard(best_rank)
 
             effective_added = max(req_tokens - self._match_len(best_rank, req_id), 0)
             all_ranks_num_active_tokens[best_rank] += effective_added
