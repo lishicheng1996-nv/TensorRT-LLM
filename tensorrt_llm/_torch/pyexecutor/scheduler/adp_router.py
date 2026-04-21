@@ -603,7 +603,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
         expected_num_active_requests = max(
-            2 * (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+            2 * ((total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size),
             max(all_ranks_num_active_requests),
         )
         eligible_ranks = [
