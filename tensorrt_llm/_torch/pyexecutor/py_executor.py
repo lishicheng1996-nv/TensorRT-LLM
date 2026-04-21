@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import threading
 import time
@@ -402,6 +403,18 @@ class PyExecutor:
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+
+        # Inject transfer-manager reference into ADP router so that its
+        # per-rank load accounting can include KV-transfer-in-progress requests
+        # (see KvCacheAwareADPRouter.create_rank_state).  The router ignores
+        # this reference unless TLLM_ADP_ROUTER_INCLUDE_TRANSFER_LOAD=1.
+        if self.adp_router is not None:
+            try:
+                self.adp_router._async_transfer_manager = \
+                    self.async_transfer_manager
+            except Exception:
+                pass
+
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -2659,6 +2672,36 @@ class PyExecutor:
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
+
+            # Diagnostic: snapshot pyexec-global state right before the ADP
+            # router sees it.  The transfer queue is the key blind spot --
+            # ADP router only sees active_requests, not requests still doing
+            # KV transfer to GEN, which is the main source of load skew.
+            # Logged from every rank so we can compare per-rank transfer load.
+            if os.environ.get("TLLM_ADP_ROUTER_DECISION_LOG") == "1":
+                try:
+                    atm = getattr(self, "async_transfer_manager", None)
+                    # requests_in_transfer is a method, not a property — call it
+                    n_in_transfer = (
+                        len(atm.requests_in_transfer()) if atm is not None else 0
+                    )
+                    try:
+                        wq_len = len(waiting_queue)
+                    except Exception:
+                        wq_len = -1
+                    logger.info(
+                        "[adp_router_v2_pyexec_snapshot] "
+                        + json.dumps({
+                            "type": "pyexec_snapshot",
+                            "tp_rank": int(getattr(self.dist, "tp_rank", -1)),
+                            "n_active_requests": len(active_requests),
+                            "n_in_transfer": int(n_in_transfer),
+                            "waiting_queue_len": int(wq_len),
+                        })
+                    )
+                except Exception as e:
+                    logger.error(f"[adp_router_v2_pyexec_snapshot] failed: {e!r}")
+
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests)
             all_ranks_num_active_requests = [

@@ -20,6 +20,7 @@ from __future__ import annotations
 import heapq
 import json
 import os
+import random
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import astuple, dataclass
@@ -356,6 +357,47 @@ class KVCacheAwareADPRouter(ADPRouter):
         # See docs/knowledge/adp_router_lbw_sweep_20260419.md §8 for consumers.
         self._decision_log_enabled = os.environ.get("TLLM_ADP_ROUTER_DECISION_LOG") == "1"
         self._decision_log_batch_id = 0
+        # Reference to the PyExecutor's AsyncTransferManager, injected by
+        # PyExecutor after construction.  Used when
+        # TLLM_ADP_ROUTER_INCLUDE_TRANSFER_LOAD=1 to include KV-transfer-in-progress
+        # requests in the per-rank load accounting.  Without this, requests that
+        # have finished prefill but are still sending KV to GEN are invisible
+        # to the router, leading to severe load skew on agentic workloads where
+        # the transfer phase dominates the request lifetime.
+        self._async_transfer_manager = None
+        self._include_transfer_load = os.environ.get(
+            "TLLM_ADP_ROUTER_INCLUDE_TRANSFER_LOAD") == "1"
+        # Cache-affinity gate: only honour match_len in scoring when the best
+        # available hit rate (max match / req_tokens across eligible ranks)
+        # exceeds this threshold.  Below it, match_len is forced to 0 for all
+        # ranks so the decision is driven purely by load.
+        #
+        # Rationale: a small but universal shared prefix (e.g. DSV3.2's 672-
+        # token thinking template) that happens to be cached by the first few
+        # warm ranks creates a permanent eff advantage of ~672 tokens.  With
+        # lbw*load_term bounded by a few hundred in disagg CTX, cold ranks
+        # never win the score contest and stay at zero traffic indefinitely.
+        # Gating cache affinity on hit rate removes the permanent bias while
+        # preserving affinity for meaningful multi-turn matches.
+        #
+        # Default 0.0 preserves pre-change behaviour (>0 always activates the
+        # affinity path).  Set e.g. 0.10 to require >=10% of req_tokens
+        # matched before cache affinity kicks in.
+        self._match_rate_threshold = float(
+            os.environ.get("TLLM_ADP_ROUTER_MATCH_RATE_THRESHOLD", "0.0")
+        )
+        # Randomize the rank iteration order on each decision so that
+        # score/active_tokens ties (common on gate_off events during cold
+        # start and between-conversation idle windows) are resolved by a
+        # uniform random pick instead of the default "lowest-index wins".
+        # Without this, low-index ranks (0, 1, 2) collect the vast majority
+        # of tie-broken routing events — e.g. 62% of gate_off seeds ended
+        # up on ranks 0-2 in the gate=0.10 run, starving rank 6/7 of new
+        # trajectories.  Purely orthogonal to the match-rate gate: the
+        # shuffle only affects tie-break order, cache-affinity wins still
+        # go to the same rank because their score is strictly lower.
+        self._randomize_tiebreak = os.environ.get(
+            "TLLM_ADP_ROUTER_RANDOMIZE_TIEBREAK") == "1"
 
     def create_rank_state(
         self,
@@ -366,19 +408,56 @@ class KVCacheAwareADPRouter(ADPRouter):
         # scale as new requests in route_requests(), which use
         # (req_tokens - match_len). Without this, requests that came in with
         # long cached prefixes inflate the apparent load on their rank.
-        if self.dist.has_cp_helix:
-            num_active_tokens = sum(
-                max(req.total_input_len_cp - req.cached_tokens, 0)
-                for req in active_requests
-            )
-        else:
-            num_active_tokens = sum(
-                max(req.py_orig_prompt_len - req.cached_tokens, 0)
-                for req in active_requests
-            )
+        def _req_tokens(req) -> int:
+            if self.dist.has_cp_helix:
+                return max(req.total_input_len_cp - req.cached_tokens, 0)
+            return max(req.py_orig_prompt_len - req.cached_tokens, 0)
+
+        num_active_tokens = sum(_req_tokens(req) for req in active_requests)
+        n_active_for_state = len(active_requests)
+
+        # Fix: include requests whose prefill is done but KV cache is still
+        # transferring to GEN.  These live in AsyncTransferManager and are
+        # removed from active_requests, so without this they're invisible
+        # to the router.  Gated by env var for safe rollout + A/B comparison.
+        n_in_transfer = 0
+        if self._include_transfer_load and self._async_transfer_manager is not None:
+            try:
+                in_transfer = self._async_transfer_manager.requests_in_transfer()
+                n_in_transfer = len(in_transfer)
+                num_active_tokens += sum(_req_tokens(r) for r in in_transfer.values())
+                n_active_for_state += n_in_transfer
+            except Exception:
+                pass
+
+        # Diagnostic: emit per-rank breakdown of active_requests by state +
+        # token sums.  Gated behind the same env var as the decision log.
+        if os.environ.get("TLLM_ADP_ROUTER_DECISION_LOG") == "1":
+            try:
+                state_counts: Dict[str, int] = {}
+                for req in active_requests:
+                    s_val = getattr(req, "state", None)
+                    s = getattr(s_val, "name", None) or str(s_val)
+                    state_counts[s] = state_counts.get(s, 0) + 1
+                logger.info(
+                    "[adp_router_v2_rank_state] "
+                    + json.dumps({
+                        "type": "rank_state",
+                        "tp_rank": int(getattr(self.dist, "tp_rank", 0)),
+                        "n_active_reqs": len(active_requests),
+                        "n_in_transfer": int(n_in_transfer),
+                        "include_transfer_load": bool(self._include_transfer_load),
+                        "n_new_reqs": len(new_requests),
+                        "sum_active_tokens": int(num_active_tokens),
+                        "state_counts": state_counts,
+                    })
+                )
+            except Exception:
+                pass
+
         return RankState(
             rank=self.dist.tp_rank,
-            num_active_requests=len(active_requests),
+            num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
         )
 
@@ -544,6 +623,8 @@ class KVCacheAwareADPRouter(ADPRouter):
                         "type": "batch",
                         "batch_id": batch_id,
                         "lbw": float(self.load_balance_weight),
+                        "match_rate_threshold": float(self._match_rate_threshold),
+                        "randomize_tiebreak": int(self._randomize_tiebreak),
                         "new_reqs": len(remaining_unscheduled),
                         "tp_size": tp_size,
                         "active_reqs_before": list(all_ranks_num_active_requests),
@@ -562,7 +643,24 @@ class KVCacheAwareADPRouter(ADPRouter):
             req_tokens = self._req_tokens(req_item)
             req_id = req_item.id
 
-            best_rank = eligible_ranks[0]
+            # When randomize_tiebreak is enabled, iterate eligible ranks in
+            # a per-decision random order.  `best_rank` picks the first
+            # shuffled entry so score ties fall through to a uniform
+            # random choice; cache-affinity wins are unaffected because
+            # their score is strictly lower.
+            #
+            # CRITICAL: every TP rank runs route_requests() locally and the
+            # decisions must agree across ranks (no broadcast).  Seed the
+            # shuffle deterministically with req_id so all ranks produce
+            # the same permutation.  Using a plain random.shuffle() with
+            # the process-global RNG state causes ranks to diverge and
+            # the distributed protocol to deadlock.
+            if self._randomize_tiebreak:
+                iter_ranks = list(eligible_ranks)
+                random.Random(req_id).shuffle(iter_ranks)
+            else:
+                iter_ranks = eligible_ranks
+            best_rank = iter_ranks[0]
             best_score = float("inf")
 
             # --- Normalize load term ---
@@ -576,19 +674,43 @@ class KVCacheAwareADPRouter(ADPRouter):
             total_load = sum(all_ranks_num_active_tokens[r] for r in eligible_ranks)
             load_denom = max(total_load, float(req_tokens))
 
+            # --- Cache-affinity gate ---
+            # If the best possible hit rate across eligible ranks is too
+            # small relative to req_tokens, zero out match_len so routing
+            # is driven purely by load.  See __init__ for rationale.
+            max_match_for_req = max(
+                (self._match_len(r, req_id) for r in eligible_ranks),
+                default=0,
+            )
+            cache_affinity_active = (
+                max_match_for_req / max(req_tokens, 1)
+            ) > self._match_rate_threshold
+
             # Snapshot pre-decision state for logging (only if enabled).
             if log_enabled:
                 snap_active_tok = list(all_ranks_num_active_tokens)
                 snap_match_len = [self._match_len(r, req_id) for r in range(tp_size)]
-                snap_eff = [max(req_tokens - snap_match_len[r], 0) for r in range(tp_size)]
+                # snap_eff reflects the gated match_len used for scoring;
+                # snap_match_len is kept raw so post-analysis can see the
+                # underlying cache state.
+                snap_eff = [
+                    max(
+                        req_tokens
+                        - (snap_match_len[r] if cache_affinity_active else 0),
+                        0,
+                    )
+                    for r in range(tp_size)
+                ]
                 snap_load_term = [
                     self.load_balance_weight * (snap_active_tok[r] / load_denom * req_tokens)
                     for r in range(tp_size)
                 ]
                 snap_score = [snap_eff[r] + snap_load_term[r] for r in range(tp_size)]
 
-            for rank in eligible_ranks:
-                match_len = self._match_len(rank, req_id)
+            for rank in iter_ranks:
+                match_len = (
+                    self._match_len(rank, req_id) if cache_affinity_active else 0
+                )
                 score = self._score_rank(
                     req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
                 )
@@ -634,6 +756,8 @@ class KVCacheAwareADPRouter(ADPRouter):
                             "routed_is_best": int(best_rank == best_cache_rank),
                             "tied_count": tied_count,
                             "tie_break_used": int(tied_count > 1),
+                            "cache_affinity_active": int(cache_affinity_active),
+                            "max_match_for_req": int(max_match_for_req),
                         })
                     )
                 except Exception:
