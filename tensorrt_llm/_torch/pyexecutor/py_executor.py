@@ -1184,7 +1184,8 @@ class PyExecutor:
         # path — skip it.
         # Non-rank-0 drops the gathered result (it's only exported on rank 0).
         tp_size = getattr(self.dist, "tp_size", 1)
-        if (self.enable_iter_perf_stats and tp_size > 1
+        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
+        if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
                 and self.enable_attention_dp):
             import json as _json
             local_dict = _json.loads(stats.to_json_str())
