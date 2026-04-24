@@ -452,6 +452,9 @@ class BaseLLM:
 
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
+        if arrival_time is not None:
+            logger.info(
+                f"[py_arrival_time] t={arrival_time.total_seconds():.6f}")
 
         self._check_arguments(
             len(prompt_token_ids),

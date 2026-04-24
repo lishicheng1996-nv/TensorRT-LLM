@@ -835,10 +835,13 @@ class OpenAIServer:
                 raise
 
         try:
+            _t_hstart = get_steady_clock_now_in_seconds()
+            _t_srv_arr = getattr(raw_request.state, "server_arrival_time", _t_hstart)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
+            _t_after_tool_dump = get_steady_clock_now_in_seconds()
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
@@ -856,6 +859,7 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
+            _t_after_sampling = get_steady_clock_now_in_seconds()
 
             try:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
@@ -868,10 +872,13 @@ class OpenAIServer:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
                     raw_messages, self.model_config,
                     self.multimodal_server_config)
+            _t_after_parse_msgs = get_steady_clock_now_in_seconds()
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
+                _skip_tokenize = 1
             else:
+                _skip_tokenize = 0
                 prompt: str = apply_chat_template(
                     model_type=self.model_config.model_type,
                     tokenizer=self.tokenizer,
@@ -884,6 +891,7 @@ class OpenAIServer:
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+            _t_after_tokenize_branch = get_steady_clock_now_in_seconds()
             prompt = prompt_inputs(prompt)
 
             mm_data, mm_embeddings = await mm_coroutines
@@ -917,6 +925,7 @@ class OpenAIServer:
                 generate_inputs = await asyncio.to_thread(
                     preprocess_fn, prompt, sampling_params,
                     disaggregated_params)
+            _t_before_gen_async = get_steady_clock_now_in_seconds()
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -928,6 +937,22 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+            )
+            _t_after_gen_async = get_steady_clock_now_in_seconds()
+            logger.info(
+                "[ctx_handler_timing] "
+                f"skip_tok={_skip_tokenize} "
+                f"srv_arr_to_hstart_ms={(_t_hstart - _t_srv_arr)*1000:.1f} "
+                f"tool_dump_ms={(_t_after_tool_dump - _t_hstart)*1000:.1f} "
+                f"sampling_ms={(_t_after_sampling - _t_after_tool_dump)*1000:.1f} "
+                f"parse_msgs_ms={(_t_after_parse_msgs - _t_after_sampling)*1000:.1f} "
+                f"tokenize_branch_ms={(_t_after_tokenize_branch - _t_after_parse_msgs)*1000:.1f} "
+                f"mm_postproc_ms={(_t_before_gen_async - _t_after_tokenize_branch)*1000:.1f} "
+                f"gen_async_ms={(_t_after_gen_async - _t_before_gen_async)*1000:.1f} "
+                f"handler_total_ms={(_t_after_gen_async - _t_srv_arr)*1000:.1f} "
+                f"n_tools={len(request.tools) if request.tools else 0} "
+                f"n_msgs={len(request.messages)} "
+                f"n_tokens={len(prompt.get('prompt_token_ids', [])) if isinstance(prompt, dict) else 0}"
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
