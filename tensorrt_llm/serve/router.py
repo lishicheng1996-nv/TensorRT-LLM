@@ -1,6 +1,7 @@
 import asyncio
 import heapq
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
@@ -705,6 +706,23 @@ class KvCacheAwareRouter(Router):
         request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
         return token_lists
 
+    def _tokenize_and_hash(
+        self,
+        request: OpenAIRequest) -> tuple[list[list[int]], list[list[int]]]:
+        """CPU-bound portion of get_next_server. Safe to run in a thread."""
+        token_lists = self._tokenize(request)
+        block_hashes: list[list[int]] = []
+        for token_list in token_lists:
+            hash_list: list[int] = []
+            # in KvCacheManager, the last token is not included in the block key
+            for t in range(0, len(token_list) - 1, self._tokens_per_block):
+                t_end = min(t + self._tokens_per_block, len(token_list) - 1)
+                hash_list.append(
+                    block_key_hasher(token_list[t:t_end],
+                                     None if t == 0 else hash_list[-1]))
+            block_hashes.append(hash_list)
+        return token_lists, block_hashes
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
@@ -714,17 +732,19 @@ class KvCacheAwareRouter(Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ])
-        token_lists = self._tokenize(request)
-        block_hashes: list[list[int]] = []
-        for token_list in token_lists:
-            hash_list = []
-            # in KvCacheManager, the last token is not included in the block key
-            for t in range(0, len(token_list) - 1, self._tokens_per_block):
-                t_end = min(t + self._tokens_per_block, len(token_list) - 1)
-                hash_list.append(
-                    block_key_hasher(token_list[t:t_end],
-                                     None if t == 0 else hash_list[-1]))
-            block_hashes.append(hash_list)
+        _t0_tok = time.perf_counter()
+        # Offload CPU-bound tokenize + block-hash to a thread so the
+        # orchestrator's asyncio event loop can dispatch other requests in
+        # parallel. At c=128 this stage alone was ~78% of orchestrator wall
+        # time (~50 ms × 2 routers × arrival rate), capping throughput at
+        # ~7.5 req/s regardless of CTX/GEN GPU capacity.
+        token_lists, block_hashes = await asyncio.to_thread(
+            self._tokenize_and_hash, request)
+        _t2_hash = time.perf_counter()
+        _n_tok = len(token_lists[0]) if token_lists else 0
+        logger.info(
+            f"[router_tokenize_timing] tokenize_and_hash_ms={(_t2_hash-_t0_tok)*1000:.1f} "
+            f"n_tokens={_n_tok}")
         padded_tokens = sum(
             len(hash_list)
             for hash_list in block_hashes) * self._tokens_per_block
