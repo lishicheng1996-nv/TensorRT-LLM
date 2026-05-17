@@ -238,15 +238,31 @@ class MegaMoEDeepGemm(MoE):
                 f"divisible by ep_size ({self.ep_size})."
             )
 
-        # ADP semantics: DG's fp8_fp4_mega_moe subsumes cross-rank token
-        # dispatch into its internal symm_mem exchange. When EP spans
-        # *all* ranks that may carry tokens (i.e. ``ep_size ==
-        # parallel_size``), no outer allgather / reducescatter is needed:
-        # every token's origin rank is inside the EP group and DG returns
-        # results to that origin. If EP is a strict subset of
-        # parallel_size (e.g. attention-DP > moe_ep_size), some tokens
-        # live on ranks that the DG kernel cannot reach — that topology
-        # is not yet supported.
+        # Topology gating: DG's fp8_fp4_mega_moe subsumes cross-rank token
+        # dispatch into its internal symm_mem exchange, which assumes the
+        # MoE input is partitioned across ranks (each rank's SymmBuffer
+        # holds a unique slice of cluster-wide tokens).
+        #
+        # Two topologies are currently supported:
+        #   (a) single rank (parallel_size == 1) — no comm.
+        #   (b) DEP with ep_size == parallel_size (attn-DP, every token's
+        #       origin rank is inside the EP group; DG routes to expert
+        #       owner and returns to origin).
+        #
+        # Two topologies are currently rejected:
+        #   - DEP with ep_size < parallel_size (attn-DP > moe_ep_size):
+        #     some tokens live on ranks the DG kernel cannot reach.
+        #   - TEP (use_dp=False, parallel_size > 1): the MoE input is
+        #     TP-replicated (attention's o_proj AllReduce gives every
+        #     rank the same full-hidden tensor). Pushing the replicated
+        #     copy into SymmBuffer makes DG see parallel_size duplicate
+        #     copies of each (token, expert) routed slot, then run the
+        #     expert compute on every copy. Math is correct because each
+        #     origin rank's slot receives its own result, but the
+        #     wall-clock cost is parallel_size× the necessary work.
+        # Both rejections are loud so users can pick a different MoE
+        # backend (e.g. moe_config.backend=TRTLLM) or fold in the right
+        # outer comm.
         if self.use_dp and self.parallel_size > 1:
             assert self.ep_size == self.parallel_size, (
                 f"MegaMoEDeepGemm with enable_attention_dp=True requires "
@@ -255,6 +271,19 @@ class MegaMoEDeepGemm(MoE):
                 f"with ADP > EP are not yet supported; add the standard "
                 f"allgather(pre) + reducescatter(post) wrapper before "
                 f"calling fp8_fp4_mega_moe to support them."
+            )
+        elif (not self.use_dp) and self.parallel_size > 1:
+            raise NotImplementedError(
+                f"MegaMoEDeepGemm does not yet support TEP "
+                f"(enable_attention_dp=False, parallel_size="
+                f"{self.parallel_size}>1, ep_size={self.ep_size}). In "
+                f"TEP the MoE input is TP-replicated, so the fused "
+                f"SymmBuffer all-to-all dispatch in fp8_fp4_mega_moe "
+                f"runs the expert compute parallel_size× on duplicated "
+                f"source rows (math correct, ~parallel_size× wall "
+                f"slowdown). Use moe_config.backend=TRTLLM (or any "
+                f"non-FUSED_COMM backend) for TEP, or enable "
+                f"attention-DP with ep_size == parallel_size."
             )
 
         # apply_router_weight_on_input pre-multiplies routing weights
